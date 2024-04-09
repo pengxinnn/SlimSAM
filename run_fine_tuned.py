@@ -1,6 +1,7 @@
 import torch
 import argparse
 
+parser = argparse.ArgumentParser()
 parser.add_argument("-pre_trained_slimsam", type=str)
 parser.add_argument("-fine_tuned_slimsam", type=str)
 
