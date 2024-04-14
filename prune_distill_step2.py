@@ -1,8 +1,9 @@
 import numpy as np
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch.optim import Adam
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import random
 from segment_anything_kd import SamPredictor, sam_model_registry
 from segment_anything_kd.modeling.image_encoder import Attention
@@ -15,6 +16,11 @@ import copy
 import json
 from pycocotools import mask as mask_utils
 import argparse
+import os
+join = os.path.join
+import glob
+import monai
+
 
 seed = 0
 np.random.seed(seed)
@@ -31,10 +37,113 @@ parser.add_argument('--valsize', type=int,default = 50)
 parser.add_argument('--epochs', type=int,default = 20)
 parser.add_argument('--norm_type', type=str,default = 'gaussian')
 parser.add_argument('--imptype', type=str,default = 'Disturb')
-parser.add_argument('--global_way', type=bool,default = True)
+parser.add_argument('--global_way', type=bool,default = False)
 parser.add_argument('--prune_ratio', type=float,default = 0.5)
-parser.add_argument('--model_path', type=str,default = 'checkpoints/vit_b_slim_step1_.pth')
+parser.add_argument('--model_path', type=str,default = 'checkpoints/vit_b_medslim_step1_.pth')
 args, unparsed = parser.parse_known_args()           
+
+class NpyDataset(Dataset):
+    def __init__(self, data_root, dataset_size, bbox_shift=20):
+        self.data_root = data_root
+        self.dataset_size = dataset_size
+        self.gt_path = join(data_root, "gts")
+        self.img_path = join(data_root, "imgs")
+        self.gt_path_files = sorted(
+            glob.glob(join(self.gt_path, "**/*.npy"), recursive=True)
+        )
+        self.gt_path_files = [
+            file
+            for file in self.gt_path_files
+            if os.path.isfile(join(self.img_path, os.path.basename(file)))
+        ]
+        self.bbox_shift = bbox_shift
+        print(f"number of images: {len(self.gt_path_files)}")
+
+    def __len__(self):
+        # return len(self.gt_path_files)
+        return self.dataset_size
+
+    def __getitem__(self, index):
+        # load npy image (1024, 1024, 3), [0,1]
+        img_name = os.path.basename(self.gt_path_files[index])
+        img_1024 = np.load(
+            join(self.img_path, img_name), "r", allow_pickle=True
+        )  # (1024, 1024, 3)
+        # convert the shape to (3, H, W)
+        img_1024 = np.transpose(img_1024, (2, 0, 1))
+        assert (
+            np.max(img_1024) <= 1.0 and np.min(img_1024) >= 0.0
+        ), "image should be normalized to [0, 1]"
+        gt = np.load(
+            self.gt_path_files[index], "r", allow_pickle=True
+        )  # multiple labels [0, 1,4,5...], (256,256)
+        assert img_name == os.path.basename(self.gt_path_files[index]), (
+            "img gt name error" + self.gt_path_files[index] + self.npy_files[index]
+        )
+        label_ids = np.unique(gt)[1:]
+        gt2D = np.uint8(
+            gt == random.choice(label_ids.tolist())
+        )  # only one label, (256, 256)
+        assert np.max(gt2D) == 1 and np.min(gt2D) == 0.0, "ground truth should be 0, 1"
+        y_indices, x_indices = np.where(gt2D > 0)
+        x_min, x_max = np.min(x_indices), np.max(x_indices)
+        y_min, y_max = np.min(y_indices), np.max(y_indices)
+        # add perturbation to bounding box coordinates
+        H, W = gt2D.shape
+        x_min = max(0, x_min - random.randint(0, self.bbox_shift))
+        x_max = min(W, x_max + random.randint(0, self.bbox_shift))
+        y_min = max(0, y_min - random.randint(0, self.bbox_shift))
+        y_max = min(H, y_max + random.randint(0, self.bbox_shift))
+        bboxes = np.array([x_min, y_min, x_max, y_max])
+        return {
+            "input_image": torch.tensor(img_1024).float(),
+            "gt": torch.tensor(gt2D[None, :, :]).long(),
+            "bboxes": torch.tensor(bboxes).float(),
+            "names_temp": img_name
+        }
+    
+class MedSAM(nn.Module):
+    def __init__(
+        self,
+        image_encoder,
+        mask_decoder,
+        prompt_encoder,
+    ):
+        super().__init__()
+        self.image_encoder = image_encoder
+        self.mask_decoder = mask_decoder
+        self.prompt_encoder = prompt_encoder
+        # freeze prompt encoder
+        for param in self.prompt_encoder.parameters():
+            param.requires_grad = False
+
+    def forward(self, image, box):
+        image_embedding,_ = self.image_encoder(image)  # (B, 256, 64, 64)
+        # do not compute gradients for prompt encoder
+        with torch.no_grad():
+            box_torch = torch.as_tensor(box, dtype=torch.float32, device=image.device)
+            if len(box_torch.shape) == 2:
+                box_torch = box_torch[:, None, :]  # (B, 1, 4)
+
+            sparse_embeddings, dense_embeddings = self.prompt_encoder(
+                points=None,
+                boxes=box_torch,
+                masks=None,
+            )
+        low_res_masks, _ = self.mask_decoder(
+            image_embeddings=image_embedding,  # (B, 256, 64, 64)
+            image_pe=self.prompt_encoder.get_dense_pe(),  # (1, 256, 64, 64)
+            sparse_prompt_embeddings=sparse_embeddings,  # (B, 2, 256)
+            dense_prompt_embeddings=dense_embeddings,  # (B, 256, 64, 64)
+            multimask_output=False,
+        )
+        ori_res_masks = F.interpolate(
+            low_res_masks,
+            size=(image.shape[2], image.shape[3]),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return ori_res_masks
 
 def train_model():
 
@@ -54,15 +163,15 @@ def train_model():
 
 
     # Creating dataset loaders
-    grad_dataset = SamDataset(root_folder=train_root_folder, dataset_size=GRAD_SIZE, val=False)
+    grad_dataset = NpyDataset(data_root=train_root_folder, dataset_size=GRAD_SIZE)
     grad_loader = DataLoader(dataset=grad_dataset, batch_size=1, shuffle=False, num_workers=4,
                               pin_memory=True, drop_last=True)
 
-    train_dataset = SamDataset(root_folder=train_root_folder, dataset_size=TRAIN_SIZE, val=False)
+    train_dataset = NpyDataset(data_root=train_root_folder, dataset_size=TRAIN_SIZE)
     train_loader = DataLoader(dataset=train_dataset, batch_size=batch_size, shuffle=True, num_workers=4,
                               pin_memory=True, drop_last=True)
 
-    val_dataset = SamDataset(root_folder=val_root_folder, dataset_size=VAL_SIZE, val=True)
+    val_dataset = NpyDataset(data_root=val_root_folder, dataset_size=VAL_SIZE)
     val_loader = DataLoader(dataset=val_dataset, batch_size=1, shuffle=False, num_workers=2,
                              pin_memory=True, drop_last=False)
 
@@ -95,7 +204,7 @@ def train_model():
 
     # teacher model
     teacher_model_type = 'vit_b'
-    checkpoint = 'checkpoints/sam_vit_b_qkv.pth'
+    checkpoint = 'checkpoints/medsam_vit_b_qkv.pth'
     teacher_model = sam_model_registry[teacher_model_type](checkpoint=checkpoint)
     teacher_model.to(device)
     teacher_model.eval()
@@ -120,6 +229,8 @@ def train_model():
     ratio = args.prune_ratio
     loss_fn = torch.nn.MSELoss()
     transform = ResizeLongestSide(1024)
+    seg_loss = monai.losses.DiceLoss(sigmoid=True, squared_pred=True, reduction="mean")
+    ce_loss = nn.BCEWithLogitsLoss(reduction="mean")
 
     norm_type = args.norm_type
     imptype = args.imptype
@@ -144,7 +255,7 @@ def train_model():
 
     for k in range(1):
 ############################################get initial grad for importance estimation############################################
-        best_iou = 0
+        best_loss = np.inf
         model.to(device)
         model.image_encoder.train()
         grad_iter = iter(grad_loader)
@@ -219,92 +330,53 @@ def train_model():
                     optimizer.zero_grad()
                 
                 #validation
+                medsam_model = MedSAM(
+                    image_encoder=model.image_encoder,
+                    mask_decoder=model.mask_decoder,
+                    prompt_encoder=model.prompt_encoder,
+                ).to(device)                    
+
                 if i == len(train_iter)-1:
-                    iou = 0
+                    total_loss = 0
+                    total_samples = 0
                     model.image_encoder.eval()
                     with torch.no_grad():
                         val_iter = iter(val_loader)
                         for j in range(len(val_iter)):
                             batch = next(val_iter)
+                            sub_count = batch["input_image"].size(0)
 
-                            input_image = batch["input_image"].to(device)
-                            input_size = batch["input_size"]
-                            original_image_size = batch["original_image_size"]
+                            image = batch["input_image"].to(device)
+                            gt2D = batch["gt"].to(device)
+                            boxes = batch["bboxes"].to(device)
 
-                            original_image_size[0] = original_image_size[0].numpy()[0]
-                            original_image_size[1] = original_image_size[1].numpy()[0]
-                            original_image_size = ([original_image_size[0],original_image_size[1]])
-
-                            input_size[0] = input_size[0].numpy()[0]
-                            input_size[1] = input_size[1].numpy()[0]
-                            input_size = ([input_size[0],input_size[1]])
-
-                            id = batch["id"]
-                            annot = batch["annot"][0]
-                            path = id[0]
-
-                            with open(annot, encoding="utf-8") as f:
-                                dict_data = json.load(f)
-                                dict_data = dict_data["annotations"]
-                                sub_count = 0
-                                sub_iou = 0
-                                for example in dict_data:
-
-                                    sub_count += 1
-
-                                    input_point = np.array(example['point_coords'])
-                                    input_label = np.array([1])
-
-                                    mask = mask_utils.decode(example["segmentation"])
-                                    
-                                    point_coords = transform.apply_coords(input_point, original_image_size)
-                                    coords_torch = torch.as_tensor(point_coords, dtype=torch.float, device=device)
-                                    labels_torch = torch.as_tensor(input_label, dtype=torch.int, device=device)
-                                    coords_torch, labels_torch = coords_torch[None, :, :], labels_torch[None, :]
-                                    points = (coords_torch, labels_torch)
-
-                                    # Model inference
-                                    image_embedding,_ = model.image_encoder(input_image)
-                                    sparse_embeddings, dense_embeddings = model.prompt_encoder(
-                                        points=points,
-                                        boxes=None,
-                                        masks=None,
-                                    )
-                                    low_res_masks, iou_predictions = model.mask_decoder(
-                                    image_embeddings=image_embedding,
-                                    image_pe=model.prompt_encoder.get_dense_pe(),
-                                    sparse_prompt_embeddings=sparse_embeddings,
-                                    dense_prompt_embeddings=dense_embeddings,
-                                    multimask_output=False,
-                                    )
-
-
-                                    student_masks = teacher_model.postprocess_masks(low_res_masks, input_size, original_image_size)
-                                    student_masks = student_masks > teacher_model.mask_threshold
-                                    student_masks = student_masks[0].detach().cpu().numpy()[0]
-
-
-                                    sub_iou += calculate_iou(student_masks, mask)
+                            boxes_np = boxes.detach().cpu().numpy()
+                            image, gt2D = image.to(device), gt2D.to(device)
+                            medsam_pred = medsam_model(image, boxes_np)
+                            sub_loss = seg_loss(medsam_pred, gt2D) + ce_loss(medsam_pred, gt2D.float())
                                 
-                            sub_iou = sub_iou/sub_count
-                            iou += sub_iou
+                            total_loss += sub_loss
+                            total_samples += sub_count
 
-
-                    iou = iou/len(val_iter)
+                    total_loss = total_loss/total_samples
                     model.image_encoder.train()
 
                     model.image_encoder.eval()
-                    if iou>=best_iou:
-                        best_iou = iou
-                        filename = 'checkpoints/vit_b_slim_step2_'+'.pth'
+                    if total_loss<=best_loss:
+                        best_loss = total_loss
+                        if global_way:
+                            prune_type = "global"
+                        else:
+                            prune_type = "local"
+                        filename = f"checkpoints/vit_b_medslim_final_step2_{ratio}_{prune_type}_{norm_type}.pth"
                         torch.save(model, filename)   
                         print("save checkpoint")
                     model.image_encoder.train()
 
-                    scheduler.step(iou)
+                    scheduler.step(total_loss)
 
                     print("epoch:",epoch)
-                    print("IOU: {} Best IOU {}".format(iou,best_iou))
+                    print("Loss: {} Best Loss {}".format(total_loss,best_loss))
 
 
 
